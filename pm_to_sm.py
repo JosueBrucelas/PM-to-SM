@@ -3,18 +3,28 @@
 pm_to_sm.py - Convert a Bitwarden Password Manager (unencrypted JSON) export
 into a Bitwarden Secrets Manager import file.
 
-Mapping:
-    Collection            -> Project   (name = collection name)
-    Secure note (type 2)  -> Secret    (key = item name, value = note body)
-    Custom fields         -> appended to the secret's "note" field
+Two modes, chosen with --item-type:
 
-Only secure notes that belong to a collection present in the export's
-"collections" list are migrated by default. Use --include-unassigned to also
-migrate secure notes that have no (known) collection; they'll be imported as
-secrets with no project.
+  note (default) - secure notes become secrets
+    Collection            -> Project   (name = collection name)
+    Secure note name      -> Secret key
+    Secure note body      -> Secret value
+    Custom fields         -> Secret note ("name: value" lines)
+
+  login - login items become secrets
+    Collection            -> Project   (name = collection name)
+    Login name            -> Secret key
+    Login password        -> Secret value
+    Login notes           -> Secret note
+
+Only items that belong to a collection present in the export's "collections"
+list are migrated by default. Use --include-unassigned to also migrate items
+that have no (known) collection; they'll be imported as secrets with no
+project.
 
 Usage:
     python3 pm_to_sm.py bitwarden_export.json -o sm_import.json
+    python3 pm_to_sm.py export.json -o out.json --item-type login
     python3 pm_to_sm.py export.json -o out.json --collections "SM" "Hunter Exam"
     python3 pm_to_sm.py export.json -o out.json --exclude-collections "Finance" "HR"
     python3 pm_to_sm.py export.json --dry-run
@@ -25,6 +35,7 @@ import json
 import re
 import sys
 
+LOGIN_TYPE = 1
 SECURE_NOTE_TYPE = 2
 FIELD_TYPE_NAMES = {0: "text", 1: "hidden", 2: "boolean", 3: "linked"}
 
@@ -54,8 +65,24 @@ def build_note(item, include_fields=True):
     return "\n".join(lines)
 
 
+def extract(item, item_type, include_fields):
+    """Return (value, note, empty_reason) for an item, or None if the item
+    isn't the type being converted."""
+    if item_type == "login":
+        if item.get("type") != LOGIN_TYPE:
+            return None
+        value = (item.get("login") or {}).get("password") or ""
+        note = item.get("notes") or ""
+        return value, note, "login has no password"
+    if item.get("type") != SECURE_NOTE_TYPE:
+        return None
+    value = item.get("notes") or ""
+    return value, build_note(item, include_fields), "secure note body is empty"
+
+
 def convert(export, collection_filter=None, exclude_filter=None,
-            include_unassigned=False, include_fields=True, skip_empty=True):
+            include_unassigned=False, include_fields=True, skip_empty=True,
+            item_type="note"):
     warnings = []
 
     if export.get("encrypted"):
@@ -88,14 +115,15 @@ def convert(export, collection_filter=None, exclude_filter=None,
     seen_keys = set()         # (collection, key)
 
     for item in export.get("items", []):
-        if item.get("type") != SECURE_NOTE_TYPE:
+        extracted = extract(item, item_type, include_fields)
+        if extracted is None:
             continue
+        value, note, empty_reason = extracted
 
         name = item.get("name") or "(unnamed)"
-        value = item.get("notes") or ""
 
         if skip_empty and not value.strip():
-            warnings.append(f"Skipped '{name}': secure note body is empty.")
+            warnings.append(f"Skipped '{name}': {empty_reason}.")
             continue
 
         item_collections = item.get("collectionIds", [])
@@ -124,7 +152,6 @@ def convert(export, collection_filter=None, exclude_filter=None,
                     f"one project per secret, so it was placed in "
                     f"'{collections[target]}' only.")
 
-        note = build_note(item, include_fields)
         project_name = collections[target] if target is not None else "(no project)"
 
         # Exact duplicate (same project, key, value and note): drop it.
@@ -233,6 +260,8 @@ def main():
     p.add_argument("input", help="Unencrypted Bitwarden PM .json export")
     p.add_argument("-o", "--output", default="sm_import.json",
                    help="Output file (default: sm_import.json)")
+    p.add_argument("--item-type", choices=["note", "login"], default="note",
+                   help="Which items to convert: secure notes (default) or logins")
     group = p.add_mutually_exclusive_group()
     group.add_argument("--collections", nargs="+", metavar="NAME",
                        help="Only migrate these collections (by exact name)")
@@ -242,9 +271,11 @@ def main():
     p.add_argument("--include-unassigned", action="store_true",
                    help="Also migrate secure notes with no collection (no project)")
     p.add_argument("--no-fields", action="store_true",
-                   help="Don't copy custom fields into the secret's note")
+                   help="Don't copy custom fields into the secret's note "
+                        "(secure notes only)")
     p.add_argument("--keep-empty", action="store_true",
-                   help="Migrate secure notes even if the note body is empty")
+                   help="Migrate items even if the value is empty "
+                        "(empty note body or no password)")
     p.add_argument("--dry-run", action="store_true",
                    help="Print a summary only; don't write a file")
     args = p.parse_args()
@@ -259,10 +290,13 @@ def main():
         include_unassigned=args.include_unassigned,
         include_fields=not args.no_fields,
         skip_empty=not args.keep_empty,
+        item_type=args.item_type,
     )
 
     # Summary (never prints secret values)
     proj_names = {pr["id"]: pr["name"] for pr in result["projects"]}
+    label = "login items" if args.item_type == "login" else "secure notes"
+    print(f"Converting {label}")
     print(f"Projects: {len(result['projects'])}   Secrets: {len(result['secrets'])}\n")
     for pr in result["projects"]:
         keys = [s["key"] for s in result["secrets"] if pr["id"] in s["projectIds"]]
